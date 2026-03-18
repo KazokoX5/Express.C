@@ -7,18 +7,11 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/select.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <limits.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <time.h>
 #include <openssl/err.h>
-#include <sys/select.h>
 #include <sys/wait.h>   
 #include <errno.h>      
 #include <ctype.h>
@@ -274,7 +267,7 @@ int  http_response_send(http_response_t *res, connection_t *conn){
         snprintf(cl, sizeof(cl), "%zu", res->body.length);
         http_response_add_header(res, "Content-Length", cl);
 }
-    char header[1024];
+    char header[4096];
     int header_len = snprintf(header, sizeof(header),
                               "HTTP/1.1 %d %s\r\n",
                               res->status_code, res->status_text);
@@ -321,11 +314,11 @@ const char *http_response_get_header_value(const http_response_t *res, const cha
 }
 
 void http_request_free(http_request_t *req){
-    if (req) {string_free(&req->body); req = NULL;}
+    if (req) string_free(&req->body);
 }
 
 void http_response_free(http_response_t *res){
-    if (res) {string_free(&res->body); res = NULL;}
+    if (res) string_free(&res->body);
 }
 
 
@@ -424,6 +417,7 @@ void default_403(connection_t *conn,  http_response_t *res, int status_code) {
 error_handler_t default_err_handlers[512] = {
     [400] = default_400,
     [404] = default_404,
+    [403] = default_403,
     [405] = default_405,
     [500] = default_500,
 };
@@ -495,6 +489,7 @@ const char *route_params_get(route_params_t *params, const char *key) {
 }
 
 
+//TODO: Wtf is this
 static int route_specificity(const char *path) {
     // count non-parameter segments — more = more specific
     int score = 0;
@@ -560,6 +555,7 @@ void server_set_error_handler(server_t *srv, int status_code, error_handler_t ha
 
 int create_server_socket(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 1) { fprintf(stderr, "Broken socket() in 'create_server_socket'"); }
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     struct sockaddr_in addr = {0};
@@ -569,6 +565,8 @@ int create_server_socket(int port) {
     bind(fd, (struct sockaddr *)&addr, sizeof(addr));
     listen(fd, 10);
     return fd;
+    cr_sock_err:
+        return -1;
 }
 
 char* get_file_data(char *filepath, long *size){
@@ -587,7 +585,6 @@ char* get_file_data(char *filepath, long *size){
     }
     fclose(f);
     return data;
-
 }
 
 
@@ -641,7 +638,7 @@ int server_prepare(server_t *srv) {
         SSL_library_init();
         OpenSSL_add_all_algorithms();
         SSL_load_error_strings();
-        srv->ctx = SSL_CTX_new(SSLv23_server_method());
+        srv->ctx = SSL_CTX_new(TLS_server_method());
         if (!srv->ctx) {
             fprintf(stderr, "Failed to create SSL context in 'server_prepare'\n");
             ERR_print_errors_fp(stderr);
@@ -655,6 +652,7 @@ int server_prepare(server_t *srv) {
             ERR_print_errors_fp(stderr);
             return -1;
         }
+    SSL_CTX_set_min_proto_version(srv->ctx, TLS1_2_VERSION);
     }
     return 0;
 }
@@ -743,6 +741,7 @@ void server_run(server_t *srv) {
             
 
             end:
+
                 http_request_free(&req);
                 conn_close(&srv->curr_conn);
                 exit(exit_int);
