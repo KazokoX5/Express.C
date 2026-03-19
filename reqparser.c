@@ -15,12 +15,12 @@
 #include <sys/wait.h>   
 #include <errno.h>      
 #include <ctype.h>
-#define BUFFER_SIZE 2048
+#define BUFFER_SIZE 16384
 
 
 
 
-
+//TODO: Improve file limits
 long get_file_size(FILE *f) {
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
@@ -75,39 +75,33 @@ int check_filepath(const char *base, const char *path) {
     return strncmp(resolved_base, resolved_path, strlen(resolved_base)) == 0;
 }
 
-void parse_path_queries(char *path, http_request_t *req){
+void parse_path_queries(char *path, http_request_t *req) {
     char *q = strstr(path, "?");
-
-    if(!q) return;
-    
+    if (!q) return;
     *q = '\0';
-    char *query = q+1;
-    char *pair = strtok(query, "&");
+    char *query = q + 1;
+
+    char *outer_save;                          // saveptr owned by the outer loop
+    char *pair = strtok_r(query, "&", &outer_save);
 
     while (pair && req->queries.query_count < QUERIES_MAX) {
         char *eq = strchr(pair, '=');
-
         if (eq) {
             *eq = '\0';
 
-            strncpy(req->queries.queries[req->queries.query_count].name,
-                    pair,
-                    sizeof(req->queries.queries[req->queries.query_count].name) - 1);
+            path_query_t *qp = &req->queries.queries[req->queries.query_count];
 
-            req->queries.queries[req->queries.query_count].name[
-                sizeof(req->queries.queries[req->queries.query_count].name) - 1] = '\0';
+            strncpy(qp->name, pair, sizeof(qp->name) - 1);
+            qp->name[sizeof(qp->name) - 1] = '\0';
+            url_decode(qp->name);
 
-            strncpy(req->queries.queries[req->queries.query_count].value,
-                    eq + 1,
-                    sizeof(req->queries.queries[req->queries.query_count].value) - 1);
-
-            req->queries.queries[req->queries.query_count].value[
-                sizeof(req->queries.queries[req->queries.query_count].value) - 1] = '\0';
+            strncpy(qp->value, eq + 1, sizeof(qp->value) - 1);
+            qp->value[sizeof(qp->value) - 1] = '\0';
+            url_decode(qp->value);
 
             req->queries.query_count++;
         }
-
-        pair = strtok(NULL, "&");
+        pair = strtok_r(NULL, "&", &outer_save);  // resume outer loop
     }
 }
 
@@ -171,7 +165,6 @@ int http_parse_request(const char *raw, size_t raw_len, http_request_t *req){
     const char *cursor = line_end + 2; // Move past the first line, since we already ate it
     while (cursor < header_end && req->header_count < MAX_HEADERS) {
 
-
         const char *end = strstr(cursor, "\r\n");
         if (!end) return -1;
         const char *colon = memchr(cursor, ':', end - cursor);
@@ -193,11 +186,12 @@ int http_parse_request(const char *raw, size_t raw_len, http_request_t *req){
         cursor = end + 2; // Move to the next line(Skip \r\n)
     }
 
-    size_t remaining = raw_len - (cursor - raw);
+    const char *body_start = header_end + 4;
+    size_t remaining = raw_len - (body_start - raw);
     if (remaining > 0) {
         req->body.data = malloc(remaining);
         if (!req->body.data) return -1;
-        memcpy(req->body.data, cursor, remaining);
+        memcpy(req->body.data, body_start, remaining);
         req->body.length = remaining;
     }
 
@@ -266,7 +260,10 @@ int  http_response_send(http_response_t *res, connection_t *conn){
         char cl[32];
         snprintf(cl, sizeof(cl), "%zu", res->body.length);
         http_response_add_header(res, "Content-Length", cl);
-}
+    }
+    if (!http_response_get_header_value(res, "Connection")){
+        http_response_add_header(res, "Connection", "close");
+    }
     char header[4096];
     int header_len = snprintf(header, sizeof(header),
                               "HTTP/1.1 %d %s\r\n",
@@ -277,6 +274,7 @@ int  http_response_send(http_response_t *res, connection_t *conn){
                                "%s: %s\r\n",
                                res->headers[i].name, res->headers[i].value);
     }
+
 
     // Final blank line
     header_len += snprintf(header + header_len, sizeof(header) - header_len, "\r\n");
@@ -355,9 +353,20 @@ ssize_t conn_read(connection_t *conn, void *buf, size_t len) {
     return recv(conn->fd, buf, len, 0);
 }
 
+
+
 ssize_t conn_write(connection_t *conn, const void *buf, size_t len) {
-    if (conn->ssl) return SSL_write(conn->ssl, buf, len);
-    return send(conn->fd, buf, len, 0);
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n;
+
+        if (conn->ssl) n = SSL_write(conn->ssl, (const char *)buf + sent, len - sent);
+        else n = send(conn->fd, (const char *)buf + sent, len - sent, 0);
+
+        if (n <= 0) return -1;
+        sent += n;
+    }
+    return (ssize_t)sent;
 }
 
 void conn_close(connection_t *conn) {
@@ -424,12 +433,9 @@ error_handler_t default_err_handlers[512] = {
 
 void check_error(server_t *srv, http_response_t *res, int status_code) {
     if (status_code >= 512) goto fallback_err;
-    if (srv->error_handlers[status_code]) {
-        srv->error_handlers[status_code](&srv->curr_conn, res, status_code);
-    } 
-    else if (default_err_handlers[status_code]) {
-        default_err_handlers[status_code](&srv->curr_conn, res ,status_code);
-    } 
+    if (srv->error_handlers[status_code]) srv->error_handlers[status_code](&srv->curr_conn, res, status_code);
+    else if (default_err_handlers[status_code]) default_err_handlers[status_code](&srv->curr_conn, res ,status_code);
+
     else {
         fallback_err:
             default_500(&srv->curr_conn, res ,500);
@@ -457,6 +463,8 @@ int match_route(const char *pattern, const char *path, route_params_t *params) {
             // store the captured param
             strncpy(params->params[params->count].key, key, sizeof(params->params[0].key) - 1);
             strncpy(params->params[params->count].value, value, sizeof(params->params[0].value) - 1);
+            url_decode(params->params[params->count].key);
+            url_decode(params->params[params->count].value);
 
 
             params->count++;
@@ -489,9 +497,12 @@ const char *route_params_get(route_params_t *params, const char *key) {
 }
 
 
-//TODO: Wtf is this
+
 static int route_specificity(const char *path) {
-    // count non-parameter segments — more = more specific
+    /* 
+    counts non-parameter segments 
+    Bsically the more literal(Nor parametized) route there is, it takes priority when choosing a rout for a path
+    */
     int score = 0;
     const char *p = path;
     while (*p) {
@@ -555,17 +566,18 @@ void server_set_error_handler(server_t *srv, int status_code, error_handler_t ha
 
 int create_server_socket(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 1) { fprintf(stderr, "Broken socket() in 'create_server_socket'"); }
+    if (fd < 0) goto err_create_sock;
     int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) goto err_create_sock;
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
-    bind(fd, (struct sockaddr *)&addr, sizeof(addr));
-    listen(fd, 10);
+    if(bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) goto err_create_sock;
+    if(listen(fd, SOMAXCONN) < 0) goto err_create_sock;
     return fd;
-    cr_sock_err:
+    err_create_sock:
+        fprintf(stderr, "Problem creating sockets in 'server_create'");
         return -1;
 }
 
@@ -591,9 +603,8 @@ char* get_file_data(char *filepath, long *size){
 void serve_static (server_t *srv, const char* path, http_response_t *res) {
     char filepath[PATH_MAX];
     snprintf(filepath, sizeof(filepath), "%s%s", srv->config.static_dir, path);
-    printf("Static path is %s",filepath);
     if (!check_filepath(srv->config.static_dir, filepath)) {
-        default_403(&srv->curr_conn, res, 403);
+        check_error(srv, res, 403);
         return;
     }
     long size = 0;
@@ -621,8 +632,10 @@ server_t *server_create(server_config_t *config) {
         return NULL;
     }
     server_t *srv = malloc(sizeof(server_t));
+    if (!srv) {fprintf(stderr, "Memory allocation for the server failed in 'server_create'\n"); return NULL;}
     srv->config = *config;
     srv->config.static_dir = srv->config.static_dir ? srv->config.static_dir : "./static";
+
     srv->http_fd = config->http_port ? create_server_socket(config->http_port) : -1;
     srv->https_fd = config->https_port ? create_server_socket(config->https_port) : -1;
     srv->ctx = NULL;
@@ -635,9 +648,9 @@ server_t *server_create(server_config_t *config) {
 
 int server_prepare(server_t *srv) {
     if (srv->config.https_port) {
-        SSL_library_init();
-        OpenSSL_add_all_algorithms();
-        SSL_load_error_strings();
+        //SSL_library_init(); Depricated apparently. OpenSSL 1.1 should auto int
+        // OpenSSL_add_all_algorithms();  same
+        // SSL_load_error_strings();  same
         srv->ctx = SSL_CTX_new(TLS_server_method());
         if (!srv->ctx) {
             fprintf(stderr, "Failed to create SSL context in 'server_prepare'\n");
@@ -652,7 +665,7 @@ int server_prepare(server_t *srv) {
             ERR_print_errors_fp(stderr);
             return -1;
         }
-    SSL_CTX_set_min_proto_version(srv->ctx, TLS1_2_VERSION);
+        SSL_CTX_set_min_proto_version(srv->ctx, TLS1_2_VERSION);
     }
     return 0;
 }
@@ -667,11 +680,11 @@ int accept_client(int http_fd, int https_fd, int *is_ssl) {
         perror("select failed");
         return -1;
     }
-    if (http_fd>0 && FD_ISSET(http_fd, &read_fds)) {
+    if (http_fd >= 0 && FD_ISSET(http_fd, &read_fds)) {
         *is_ssl = 0;
         return accept(http_fd, NULL, NULL);
     }
-    if (https_fd>0 && FD_ISSET(https_fd, &read_fds)) {
+    if (https_fd >= 0 && FD_ISSET(https_fd, &read_fds)) {
         *is_ssl = 1;
         return accept(https_fd, NULL, NULL);
     }
@@ -681,11 +694,13 @@ int accept_client(int http_fd, int https_fd, int *is_ssl) {
 void server_run(server_t *srv) {
     int exit_int = 0;
     int is_ssl = 0;
+    signal(SIGCHLD, SIG_IGN);
     while(1){
         exit_int = 0;
         int client_fd = accept_client(srv->http_fd, srv->https_fd, &is_ssl);
         if (client_fd < 0) continue;
 
+        
         pid_t pid = fork();
         if (pid < 0) { perror("fork failed"); close(client_fd); continue; }
         if (pid == 0) {
@@ -712,6 +727,7 @@ void server_run(server_t *srv) {
                 }
             }
             
+
             char buffer[BUFFER_SIZE] = {0};
             ssize_t bytes = conn_read(&srv->curr_conn, buffer, sizeof(buffer) - 1);
             if (bytes <= 0) { check_error(srv,&res, 400); exit_int = 1; goto end; }
@@ -724,10 +740,12 @@ void server_run(server_t *srv) {
             // find matching route
             route_t *route = NULL;
             int path_exist = 0;
+            int path_found = 0;
             route_params_t params = {0};
             for (int i = 0; i < srv->route_count; i++) {
-                path_exist = match_route(srv->routes[i].path, req.path, &params);
-                if (path_exist && strcmp(srv->routes[i].method, req.method) == 0) {
+                path_found = match_route(srv->routes[i].path, req.path, &params);
+                path_exist = path_exist ? 1 : path_found;
+                if (path_found && strcmp(srv->routes[i].method, req.method) == 0) {
                     route = &srv->routes[i];    
                     route->params = params;
                     break;
@@ -746,7 +764,6 @@ void server_run(server_t *srv) {
                 conn_close(&srv->curr_conn);
                 exit(exit_int);
         }   
-        waitpid(-1, NULL, WNOHANG);
         close(client_fd);
     }
 }
