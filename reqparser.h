@@ -16,9 +16,12 @@
 #define QUERIES_MAX 16
 #define PARAMS_MAX 16
 
+#define MAX_REQUEST_SIZE (10 * 1024 * 1024)
+
 #ifndef HTTP_PATH_SIZE
 #define HTTP_PATH_SIZE 1024
 #endif
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -37,9 +40,7 @@ typedef struct {
     SSL *ssl;
 } connection_t;
 
-ssize_t conn_read(connection_t *conn, void *buf, size_t len);
-ssize_t conn_write(connection_t *conn, const void *buf, size_t len);
-void    conn_close(connection_t *conn);
+
 
 // ─── HTTP TYPES ──────────────────────────────────────────────────────────────
 
@@ -185,7 +186,6 @@ void route_set_global_order(server_t *srv, const char *method, const char *path,
 
 // ─── ERROR HANDLERS ──────────────────────────────────────────────────────────
 
-void check_error(server_t *srv, http_response_t *res, int status_code);
 void server_set_error_handler(server_t *srv, int status_code, error_handler_t handler);
 
 #endif

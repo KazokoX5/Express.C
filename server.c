@@ -12,7 +12,6 @@ server_t *g_srv = NULL;
 /* ---------------------------Middleware--------------------------- */
 
 void logger(http_request_t *req, http_response_t *res, server_t *srv, route_t *route, int current){
-    (void)srv; (void)route; (void)current;
     printf("[LOG] %s %s\n", req->method, req->path);
     chain_next(req, res, srv, route, current);
     printf("[LOG] response status: %d\n", res->status_code);
@@ -34,7 +33,6 @@ void auth(http_request_t *req, http_response_t *res, server_t *srv, route_t *rou
 /* ---------------------------Handlers--------------------------- */
 
 void on_hello(connection_t *conn, http_request_t *req, http_response_t *res, route_params_t *params){
-    (void)req; (void)params;
     const char *body = "Hello, world!";
     http_response_set_status(res, 200, "OK");
     http_response_add_header(res, "Content-Type", "text/plain");
@@ -55,15 +53,14 @@ void on_user(connection_t *conn,http_request_t *req, http_response_t *res, route
 }
 
 void on_search(connection_t *conn, http_request_t *req, http_response_t *res, route_params_t *params){
-    (void)params;
     const char *q = NULL;
     const char *page = NULL;
     int count = 0;
     path_queries_t *queries = &req->queries;
     for (int i = 0; i < queries->query_count; i++) {
-        printf("%s %s\n",queries->queries[i].name,queries->queries[i].value);
+        printf("%s %s\n",queries->queries[i].name, queries->queries[i].value);
         if (strcmp(queries->queries[i].name, "q") == 0)            q = queries->queries[i].value;
-        else if (strcmp(queries->queries[i].name, "pages") == 0)            page = queries->queries[i].value;
+        else if (strcmp(queries->queries[i].name, "page") == 0)            page = queries->queries[i].value;
         else count++;
     }
     char body[256];
@@ -78,7 +75,6 @@ void on_search(connection_t *conn, http_request_t *req, http_response_t *res, ro
 }
 
 void on_files(connection_t *conn, http_request_t *req, http_response_t *res, route_params_t *params){
-    (void)params;
     if (g_srv) {
         const char *path = route_params_get(params, "*");
         char start[PATH_MAX] = "/";
@@ -95,7 +91,6 @@ void on_files(connection_t *conn, http_request_t *req, http_response_t *res, rou
 }
 
 void on_secret(connection_t *conn, http_request_t *req, http_response_t *res, route_params_t *params){
-    (void)params;
     http_response_set_status(res, 200, "OK");
     http_response_add_header(res, "Content-Type", "text/plain");
     http_response_set_body(res, "secret data", strlen("secret data"));
@@ -108,7 +103,6 @@ void on_secret(connection_t *conn, http_request_t *req, http_response_t *res, ro
 
 void my_404(connection_t *conn, http_response_t *res, int status_code)
 {
-    (void)status_code;
     http_response_set_status(res, 404, "Not Found");
     http_response_add_header(res, "Content-Type", "text/html");
     http_response_set_body(res, "<h1>Custom 404</h1>", strlen("<h1>Custom 404</h1>"));
@@ -118,7 +112,7 @@ void my_404(connection_t *conn, http_response_t *res, int status_code)
 
 /* ---------------------------Main--------------------------- */
 
-int main(void)
+int main()
 {
     server_config_t config = {
         .http_port   = 8080,
@@ -138,7 +132,7 @@ int main(void)
 
     server_use(g_srv, logger);
 
-
+    
     server_get(g_srv,  "/hello",    on_hello);
     server_get(g_srv,  "/user/:id", on_user);
     server_get(g_srv,  "/search",   on_search);

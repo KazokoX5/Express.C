@@ -18,6 +18,12 @@
 #define BUFFER_SIZE 16384
 
 
+static ssize_t conn_read(connection_t *conn, void *buf, size_t len);
+static int read_more(connection_t *conn, char **buf, size_t *len, size_t *capacity, size_t needed_offset);
+static int ensure_bytes(connection_t *conn, char **buf, size_t *len, size_t *capacity, size_t offset, size_t needed);
+static ssize_t conn_write(connection_t *conn, const void *buf, size_t len);
+static void conn_close(connection_t *conn);
+static void check_error(server_t *srv, http_response_t *res, int status_code);
 
 
 //TODO: Improve file limits
@@ -66,11 +72,11 @@ const char *get_content_type(const char *path) {
     return "application/octet-stream";  // unknown binary — download
 }
 
-// Check if path starts with base
+//Check if path starts with base
 int check_filepath(const char *base, const char *path) {
     char resolved_base[PATH_MAX], resolved_path[PATH_MAX];
     if (!realpath(base, resolved_base) || !realpath(path, resolved_path)) {
-        return 0; // Invalid path
+        return 0; //Invalid path(s)
     }
     return strncmp(resolved_base, resolved_path, strlen(resolved_base)) == 0;
 }
@@ -200,7 +206,110 @@ int http_parse_request(const char *raw, size_t raw_len, http_request_t *req){
 }
 
 
+char *get_full_request(connection_t *conn, size_t *out_len) {
+    size_t capacity = BUFFER_SIZE;
+    size_t len = 0;
+    char *buf = malloc(capacity);
+    if (!buf) return NULL;
 
+    //Read til \r\n\r\n
+    while (!strstr(buf, "\r\n\r\n")) {
+        if (len > MAX_REQUEST_SIZE) { free(buf); return NULL;}
+        if (read_more(conn, &buf, &len, &capacity, 0) < 0) {
+            free(buf); return NULL;
+        }
+    }
+
+    size_t headers_end = (strstr(buf, "\r\n\r\n") - buf) + 4;
+
+    //Content-Length case
+    const char *cl = strstr(buf, "Content-Length:");
+    if (!cl) cl = strstr(buf, "content-length:");
+    if (cl) {
+        size_t content_length = strtoul(cl + 15, NULL, 10);
+        size_t total_needed = headers_end + content_length;
+        if (total_needed > MAX_REQUEST_SIZE) { free(buf); return NULL; }
+
+        //Read til we have all body bytes
+        while (len < total_needed) {
+            if (read_more(conn, &buf, &len, &capacity, 0) < 0) break;
+        }
+        *out_len = len;
+        return buf;
+    }
+
+    //Chunked encoding case
+    const char *te = strstr(buf, "Transfer-Encoding: chunked");
+    if (!te) te = strstr(buf, "transfer-encoding: chunked");
+    if (te) {
+        size_t body_capacity = BUFFER_SIZE;
+        char *body = malloc(body_capacity);
+        if (!body) { free(buf); return NULL; }
+        size_t body_len = 0;
+
+        size_t cursor = headers_end;
+
+        while (1) {
+            //Read til we have a complete line (\r\n)
+            while (1) {
+                int found = 0;
+                for (size_t i = cursor; i + 1 < len; i++) {
+                    if (buf[i] == '\r' && buf[i+1] == '\n') { found = 1; break; }
+                }
+                if (found) break;
+                if (read_more(conn, &buf, &len, &capacity, cursor) < 0) {
+                    free(body); free(buf); return NULL;
+                }
+            }
+
+            //Parse hex chunk size
+            char size_buf[32] = {0};
+            int si = 0;
+            while (cursor < len && buf[cursor] != '\r' && si < 31)
+                size_buf[si++] = buf[cursor++];
+            cursor += 2; //Skip \r\n
+
+            size_t chunk_size = strtoul(size_buf, NULL, 16);
+            if (chunk_size == 0) break; //Final chunk
+
+            //Make sure chunk data + trailing \r\n are in buf
+            if (ensure_bytes(conn, &buf, &len, &capacity, cursor, chunk_size + 2) < 0) {
+                free(body); free(buf); return NULL;
+            }
+
+            //Grow body buf if needed
+            if (body_len + chunk_size >= body_capacity) {
+                size_t new_cap = body_len + chunk_size + 1;
+                if (new_cap > MAX_REQUEST_SIZE) { free(body); free(buf); return NULL; }
+                char *tmp = realloc(body, new_cap);
+                if (!tmp) { free(body); free(buf); return NULL; }
+                body = tmp;
+                body_capacity = new_cap;
+            }
+
+            memcpy(body + body_len, buf + cursor, chunk_size);
+            body_len += chunk_size;
+            cursor += chunk_size + 2; //Skip data + \r\n
+        }
+
+        //Remake headers + decoded body
+        size_t result_len = headers_end + body_len;
+        char *result = malloc(result_len + 1);
+        if (!result) { free(body); free(buf); return NULL; }
+        memcpy(result, buf, headers_end);
+        memcpy(result + headers_end, body, body_len);
+        result[result_len] = '\0';
+
+        free(body);
+        free(buf);
+        *out_len = result_len;
+        return result;
+    }
+
+    //Request kinda bodiless
+    *out_len = len;
+    return buf;
+}
 
 
 
@@ -347,37 +456,90 @@ HANDLER
 
 
 
+static ssize_t conn_read(connection_t *conn, void *buf, size_t len) {
+    if (conn->ssl) {
+        while(1) {
+            int n = SSL_read(conn->ssl, buf, (int)len);
+            if (n > 0) return n;
 
-ssize_t conn_read(connection_t *conn, void *buf, size_t len) {
-    if (conn->ssl) return SSL_read(conn->ssl, buf, len);
+            int err = SSL_get_error(conn->ssl, n);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+                continue;
+            return -1;
+        }
+    }
     return recv(conn->fd, buf, len, 0);
 }
 
+// Reads more data into buf, growing if needed
+static int read_more(connection_t *conn, char **buf, size_t *len, size_t *capacity, size_t needed_offset) {
+
+    while (*capacity <= *len + 1) {
+        if (*capacity * 2 > MAX_REQUEST_SIZE) return -1;
+        char *tmp = realloc(*buf, *capacity * 2);
+        if (!tmp) return -1;
+        *buf = tmp;
+        *capacity *= 2;
+    }
+    ssize_t bytes = conn_read(conn, *buf + *len, *capacity - *len - 1);
+    if (bytes <= 0) return -1;
+    *len += bytes;
+    (*buf)[*len] = '\0';
+    return 0;
+}
+
+// Makes sure at least `offset + needed` bytes are in buf, reading more if not
+static int ensure_bytes(connection_t *conn, char **buf, size_t *len, size_t *capacity, size_t offset, size_t needed) {
+    while (*len < offset + needed) {
+        if (read_more(conn, buf, len, capacity, offset) < 0) return -1;
+    }
+    return 0;
+}
 
 
-ssize_t conn_write(connection_t *conn, const void *buf, size_t len) {
+static ssize_t conn_write(connection_t *conn, const void *buf, size_t len) {
     size_t sent = 0;
+
     while (sent < len) {
         ssize_t n;
 
-        if (conn->ssl) n = SSL_write(conn->ssl, (const char *)buf + sent, len - sent);
-        else n = send(conn->fd, (const char *)buf + sent, len - sent, 0);
+        if (conn->ssl) {
+            int r = SSL_write(conn->ssl, (const char *)buf + sent, (int)(len - sent));
+            if (r > 0) {
+                n = r;
+            } else {
+                int err = SSL_get_error(conn->ssl, r);
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+                    continue;
+                return -1;
+            }
+        } else {
+            n = send(conn->fd, (const char *)buf + sent, len - sent, 0);
+            if (n <= 0) return -1;
+        }
 
-        if (n <= 0) return -1;
         sent += n;
     }
+
     return (ssize_t)sent;
 }
 
-void conn_close(connection_t *conn) {
-    if (conn->ssl) { SSL_shutdown(conn->ssl); SSL_free(conn->ssl); }
-    close(conn->fd);
+static void conn_close(connection_t *conn) {
+    if (conn->ssl) {
+        SSL_shutdown(conn->ssl);
+        SSL_free(conn->ssl);
+        conn->ssl = NULL;
+    }
+    if (conn->fd >= 0) {
+        close(conn->fd);
+        conn->fd = -1;
+    }
 }
 
 
 // Default error handlers
 
-void default_400(connection_t *conn, http_response_t *res, int status_code) {
+static void default_400(connection_t *conn, http_response_t *res, int status_code) {
     http_response_init(res);
     http_response_set_status(res, 400, "Bad Request");
     http_response_add_header(res, "Content-Type", "text/html");
@@ -386,7 +548,7 @@ void default_400(connection_t *conn, http_response_t *res, int status_code) {
     http_response_free(res);
 }
 
-void default_404(connection_t *conn,  http_response_t *res,int status_code) {
+static void default_404(connection_t *conn,  http_response_t *res,int status_code) {
     http_response_init(res);
     http_response_set_status(res, 404, "Not Found");
     http_response_add_header(res, "Content-Type", "text/html");
@@ -395,7 +557,7 @@ void default_404(connection_t *conn,  http_response_t *res,int status_code) {
     http_response_free(res);
 }
 
-void default_405(connection_t *conn,  http_response_t *res, int status_code) {
+static void default_405(connection_t *conn,  http_response_t *res, int status_code) {
     http_response_init(res);
     http_response_set_status(res, 405, "Method Not Allowed");
     http_response_add_header(res, "Content-Type", "text/html");
@@ -404,7 +566,7 @@ void default_405(connection_t *conn,  http_response_t *res, int status_code) {
     http_response_free(res);
 }
 
-void default_500(connection_t *conn,  http_response_t *res, int status_code) {
+static void default_500(connection_t *conn,  http_response_t *res, int status_code) {
     http_response_init(res);
     http_response_set_status(res, 500, "Internal Server Error");
     http_response_add_header(res, "Content-Type", "text/html");
@@ -413,7 +575,7 @@ void default_500(connection_t *conn,  http_response_t *res, int status_code) {
     http_response_free(res);
 }
 
-void default_403(connection_t *conn,  http_response_t *res, int status_code) {
+static void default_403(connection_t *conn,  http_response_t *res, int status_code) {
     http_response_init(res);
     http_response_set_status(res, 403, "Forbidden");
     http_response_add_header(res, "Content-Type", "text/html");
@@ -431,7 +593,7 @@ error_handler_t default_err_handlers[512] = {
     [500] = default_500,
 };
 
-void check_error(server_t *srv, http_response_t *res, int status_code) {
+static void check_error(server_t *srv, http_response_t *res, int status_code) {
     if (status_code >= 512) goto fallback_err;
     if (srv->error_handlers[status_code]) srv->error_handlers[status_code](&srv->curr_conn, res, status_code);
     else if (default_err_handlers[status_code]) default_err_handlers[status_code](&srv->curr_conn, res ,status_code);
@@ -444,7 +606,7 @@ void check_error(server_t *srv, http_response_t *res, int status_code) {
 
 // Setting routes
 
-int match_route(const char *pattern, const char *path, route_params_t *params) {
+static int match_route(const char *pattern, const char *path, route_params_t *params) {
     params->count = 0;
     while (*pattern && *path) {
         if (*pattern == ':') {
@@ -500,8 +662,8 @@ const char *route_params_get(route_params_t *params, const char *key) {
 
 static int route_specificity(const char *path) {
     /* 
-    counts non-parameter segments 
-    Bsically the more literal(Nor parametized) route there is, it takes priority when choosing a rout for a path
+    Counts non-parameter segments 
+    Bsically the more literal(Nor parametized) route takes priority when choosing a rout for a path
     */
     int score = 0;
     const char *p = path;
@@ -564,7 +726,7 @@ void server_set_error_handler(server_t *srv, int status_code, error_handler_t ha
 //Server 
 
 
-int create_server_socket(int port) {
+static int create_server_socket(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) goto err_create_sock;
     int opt = 1;
@@ -581,7 +743,7 @@ int create_server_socket(int port) {
         return -1;
 }
 
-char* get_file_data(char *filepath, long *size){
+static char* get_file_data(char *filepath, long *size){
     FILE *f = fopen(filepath, "rb");
     if (!f){fprintf(stderr,"Couldn't open file from path %s",filepath); return NULL;}
     *size = get_file_size(f);
@@ -607,6 +769,7 @@ void serve_static (server_t *srv, const char* path, http_response_t *res) {
         check_error(srv, res, 403);
         return;
     }
+    
     long size = 0;
     char *data = get_file_data(filepath, &size);
     if(!data){check_error(srv, res ,500); goto serve_end;}
@@ -670,7 +833,7 @@ int server_prepare(server_t *srv) {
     return 0;
 }
 
-int accept_client(int http_fd, int https_fd, int *is_ssl) {
+static int accept_client(int http_fd, int https_fd, int *is_ssl) {
     fd_set read_fds;
     FD_ZERO(&read_fds);
     if (http_fd >= 0) FD_SET(http_fd, &read_fds);
@@ -727,16 +890,12 @@ void server_run(server_t *srv) {
                 }
             }
             
+            size_t req_len = 0;
+            char *buffer = get_full_request(&srv->curr_conn, &req_len);
+            if (!buffer) {check_error(srv, &res, 400); exit_int = 1; goto end;}
 
-            char buffer[BUFFER_SIZE] = {0};
-            ssize_t bytes = conn_read(&srv->curr_conn, buffer, sizeof(buffer) - 1);
-            if (bytes <= 0) { check_error(srv,&res, 400); exit_int = 1; goto end; }
-
-
-
-            if (http_parse_request(buffer, bytes, &req) < 0) {check_error(srv,&res,400); exit_int = 1; goto end;
-}
-
+            if (http_parse_request(buffer, req_len, &req) < 0) {free(buffer); check_error(srv,&res,400); exit_int = 1; goto end;}
+            free(buffer);
             // find matching route
             route_t *route = NULL;
             int path_exist = 0;
@@ -825,7 +984,7 @@ void chain_next(http_request_t *req, http_response_t *res,server_t *srv, route_t
             chain[count++] = srv->global_middleware[i];
     } 
     else {
-        // no global
+        //No global
         for (int i = 0; i < route->middleware_count; i++)
             chain[count++] = route->middleware[i];
     }
@@ -838,8 +997,7 @@ void chain_next(http_request_t *req, http_response_t *res,server_t *srv, route_t
 
 void route_set_global(server_t *srv, const char *method, const char *path, int use_global) {
     for (int i = 0; i < srv->route_count; i++) {
-        if (strcasecmp(srv->routes[i].method, method) == 0 &&
-            strcmp(srv->routes[i].path, path) == 0) {
+        if (strcasecmp(srv->routes[i].method, method) == 0 && strcmp(srv->routes[i].path, path) == 0) {
             srv->routes[i].use_global = use_global;
             return;
         }
@@ -849,8 +1007,7 @@ void route_set_global(server_t *srv, const char *method, const char *path, int u
 
 void route_set_global_order(server_t *srv, const char *method, const char *path, int global_first) {
     for (int i = 0; i < srv->route_count; i++){
-        if (strcasecmp(srv->routes[i].method, method) == 0 &&
-            strcmp(srv->routes[i].path, path) == 0) {
+        if (strcasecmp(srv->routes[i].method, method) == 0 && strcmp(srv->routes[i].path, path) == 0) {
             srv->routes[i].global_first = global_first;
             return;
         }
